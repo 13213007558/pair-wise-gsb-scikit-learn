@@ -88,12 +88,45 @@ the API of standard scikit-learn estimators, :class:`GaussianProcessRegressor`:
   externally for other ways of selecting hyperparameters, e.g., via
   Markov chain Monte Carlo.
 
+.. _gpr_derivatives:
+
+Partial-derivative observations
+-------------------------------
+
+In addition to observations of the function value, measurements might
+include the partial derivative of the function with respect to one of its
+input features at a few locations.
+:class:`GaussianProcessRegressor` can fit such observations jointly: the
+covariance between function values and derivatives follows from the
+derivative properties of a Gaussian process, i.e. by differentiating the
+kernel. Each observation passed to :meth:`GaussianProcessRegressor.fit` is
+tagged through its ``derivative`` argument: ``-1`` denotes a function-value
+observation and a non-negative index ``d`` denotes an observation of the
+partial derivative along feature ``d``. The noise levels of the two kinds
+of observations are controlled independently by ``alpha`` (function values)
+and ``derivative_alpha`` (derivatives). Hyperparameter optimization, the
+joint covariance matrix and the posterior all include the derivative
+observations. :meth:`GaussianProcessRegressor.predict` and
+:meth:`GaussianProcessRegressor.sample_y` accept the same ``derivative``
+argument, so the fitted model can predict function values and derivatives,
+including their joint covariance.
+
+This first version supports kernels that are the product of a
+:class:`~sklearn.gaussian_process.kernels.ConstantKernel` and an
+(an)isotropic :class:`~sklearn.gaussian_process.kernels.RBF`, which is
+infinitely differentiable and whose mixed covariances have a closed form.
+Note that passing a measured slope as if it were an ordinary target value
+does not reproduce this model: the slope is the value of a different,
+derived random function and is linked to the function through the
+differentiated kernel.
+
 .. rubric:: Examples
 
 * :ref:`sphx_glr_auto_examples_gaussian_process_plot_gpr_noisy_targets.py`
 * :ref:`sphx_glr_auto_examples_gaussian_process_plot_gpr_noisy.py`
 * :ref:`sphx_glr_auto_examples_gaussian_process_plot_compare_gpr_krr.py`
 * :ref:`sphx_glr_auto_examples_gaussian_process_plot_gpr_co2.py`
+* :ref:`sphx_glr_auto_examples_gaussian_process_plot_gpr_derivative_observations.py`
 
 .. _gpc:
 

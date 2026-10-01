@@ -1,0 +1,12 @@
+- :class:`gaussian_process.GaussianProcessRegressor` now accepts
+  observations of partial derivatives in addition to function values.
+  Pass an array to the new ``derivative`` argument of :meth:`fit`, tagging
+  each observation as a function value (``-1``) or as the partial derivative
+  along a feature (its index). :meth:`predict` (and :meth:`sample_y`)
+  accept the same argument to predict function values or derivatives,
+  including their joint covariance. The new ``derivative_alpha`` parameter
+  sets the noise level of the derivative observations, independently of
+  ``alpha`` for function values. Kernel support is restricted, in this
+  first version, to a :class:`gaussian_process.kernels.ConstantKernel`
+  multiplied by an (an)isotropic :class:`gaussian_process.kernels.RBF`.
+  By :user:`Claude Code <anthropic-claude-code>`.

@@ -18,6 +18,14 @@ from sklearn.base import (
     _fit_context,
     clone,
 )
+from sklearn.gaussian_process._derivative import (
+    FUNCTION_TAG,
+    _check_derivative,
+    _mixed_covariance,
+    _mixed_covariance_gradient,
+    _mixed_diag,
+    _unpack_constant_rbf,
+)
 from sklearn.gaussian_process.kernels import RBF, Kernel
 from sklearn.gaussian_process.kernels import ConstantKernel as C
 from sklearn.preprocessing._data import _handle_zeros_in_scale
@@ -77,6 +85,15 @@ class GaussianProcessRegressor(MultiOutputMixin, RegressorMixin, BaseEstimator):
         For an example illustrating how the alpha parameter controls
         the noise variance in Gaussian Process Regression, see
         :ref:`sphx_glr_auto_examples_gaussian_process_plot_gpr_noisy_targets.py`.
+
+    derivative_alpha : float or ndarray of shape (n_derivative_observations,),\
+            default=1e-10
+        Noise variance added to observations of partial derivatives. Only
+        used when partial-derivative observations are passed to :meth:`fit`
+        through its ``derivative`` parameter. Like ``alpha``, it can be a
+        scalar or an array with one entry per derivative observation, so
+        that function-value and derivative observations can be assigned
+        different noise levels.
 
     optimizer : "fmin_l_bfgs_b", callable or None, default="fmin_l_bfgs_b"
         Can either be one of the internally supported optimizers for optimizing
@@ -157,6 +174,17 @@ class GaussianProcessRegressor(MultiOutputMixin, RegressorMixin, BaseEstimator):
     alpha_ : array-like of shape (n_samples,)
         Dual coefficients of training data points in kernel space.
 
+    derivative_ : ndarray of shape (n_samples,)
+        For every training observation, ``-1`` for a function-value
+        observation and the index of the differentiated feature otherwise.
+        Only present after :meth:`fit`.
+
+    alpha_diag_ : ndarray of shape (n_samples,)
+        Per-observation noise variance added to the diagonal of the
+        (possibly mixed) training covariance: ``alpha`` for
+        function-value observations and ``derivative_alpha`` for
+        derivative observations. Only present after :meth:`fit`.
+
     log_marginal_likelihood_value_ : float
         The log-marginal-likelihood of ``self.kernel_.theta``.
 
@@ -200,6 +228,10 @@ class GaussianProcessRegressor(MultiOutputMixin, RegressorMixin, BaseEstimator):
     _parameter_constraints: dict = {
         "kernel": [None, Kernel],
         "alpha": [Interval(Real, 0, None, closed="left"), np.ndarray],
+        "derivative_alpha": [
+            Interval(Real, 0, None, closed="left"),
+            np.ndarray,
+        ],
         "optimizer": [StrOptions({"fmin_l_bfgs_b"}), callable, None],
         "n_restarts_optimizer": [Interval(Integral, 0, None, closed="left")],
         "normalize_y": ["boolean"],
@@ -213,6 +245,7 @@ class GaussianProcessRegressor(MultiOutputMixin, RegressorMixin, BaseEstimator):
         kernel=None,
         *,
         alpha=1e-10,
+        derivative_alpha=1e-10,
         optimizer="fmin_l_bfgs_b",
         n_restarts_optimizer=0,
         normalize_y=False,
@@ -222,6 +255,7 @@ class GaussianProcessRegressor(MultiOutputMixin, RegressorMixin, BaseEstimator):
     ):
         self.kernel = kernel
         self.alpha = alpha
+        self.derivative_alpha = derivative_alpha
         self.optimizer = optimizer
         self.n_restarts_optimizer = n_restarts_optimizer
         self.normalize_y = normalize_y
@@ -230,7 +264,7 @@ class GaussianProcessRegressor(MultiOutputMixin, RegressorMixin, BaseEstimator):
         self.random_state = random_state
 
     @_fit_context(prefer_skip_nested_validation=True)
-    def fit(self, X, y):
+    def fit(self, X, y, derivative=None):
         """Fit Gaussian process regression model.
 
         Parameters
@@ -239,7 +273,24 @@ class GaussianProcessRegressor(MultiOutputMixin, RegressorMixin, BaseEstimator):
             Feature vectors or other representations of training data.
 
         y : array-like of shape (n_samples,) or (n_samples, n_targets)
-            Target values.
+            Target values. When ``derivative`` marks a row as the
+            observation of a partial derivative, the corresponding entry
+            of ``y`` is the value of that partial derivative.
+
+        derivative : array-like of shape (n_samples,), default=None
+            Kind of observation made at each row of ``X``. Entries equal
+            to -1 (the default for all rows when ``derivative=None``)
+            denote observations of the function value; a non-negative
+            entry ``d`` denotes an observation of the partial derivative
+            of the function with respect to feature ``d``.
+
+            When derivative observations are present, the kernel is
+            restricted to a product of a
+            :class:`~sklearn.gaussian_process.kernels.ConstantKernel` and
+            an :class:`~sklearn.gaussian_process.kernels.RBF` kernel (the
+            RBF kernel may be anisotropic). Function-value observations
+            use the noise level ``alpha`` while derivative observations
+            use ``derivative_alpha``.
 
         Returns
         -------
@@ -264,6 +315,17 @@ class GaussianProcessRegressor(MultiOutputMixin, RegressorMixin, BaseEstimator):
             dtype=dtype,
         )
 
+        self.derivative_ = _check_derivative(derivative, X)
+        self._has_derivatives = bool(np.any(self.derivative_ >= 0))
+        if self._has_derivatives:
+            (
+                self._constant_kernel_,
+                self._rbf_kernel_,
+            ) = _unpack_constant_rbf(self.kernel_)
+        else:
+            self._constant_kernel_ = None
+            self._rbf_kernel_ = None
+
         n_targets_seen = y.shape[1] if y.ndim > 1 else 1
         if self.n_targets is not None and n_targets_seen != self.n_targets:
             raise ValueError(
@@ -271,30 +333,39 @@ class GaussianProcessRegressor(MultiOutputMixin, RegressorMixin, BaseEstimator):
                 f"`n_targets`. Got {n_targets_seen} != {self.n_targets}."
             )
 
+        is_function = self.derivative_ == FUNCTION_TAG
+        function_rows = np.where(is_function)[0]
         # Normalize target value
         if self.normalize_y:
-            self._y_train_mean = np.mean(y, axis=0)
-            self._y_train_std = _handle_zeros_in_scale(np.std(y, axis=0), copy=False)
+            if function_rows.size == 0:
+                # The derivative of a zero-mean process still has mean zero;
+                # the scale is left at 1 when no function value is observed.
+                self._y_train_mean = np.zeros(y.shape[1] if y.ndim == 2 else 1)
+                self._y_train_std = np.ones_like(self._y_train_mean)
+            else:
+                self._y_train_mean = np.mean(y[function_rows], axis=0)
+                self._y_train_std = _handle_zeros_in_scale(
+                    np.std(y[function_rows], axis=0), copy=False
+                )
 
-            # Remove mean and make unit variance
-            y = (y - self._y_train_mean) / self._y_train_std
+            # Remove mean and make unit variance. The (constant) mean's
+            # derivative is zero, so derivative observations are only
+            # rescaled.
+            y = y.copy()
+            y[is_function] = (y[is_function] - self._y_train_mean) / self._y_train_std
+            y[~is_function] = y[~is_function] / self._y_train_std
 
         else:
             shape_y_stats = (y.shape[1],) if y.ndim == 2 else 1
             self._y_train_mean = np.zeros(shape=shape_y_stats)
             self._y_train_std = np.ones(shape=shape_y_stats)
 
-        if np.iterable(self.alpha) and self.alpha.shape[0] != y.shape[0]:
-            if self.alpha.shape[0] == 1:
-                self.alpha = self.alpha[0]
-            else:
-                raise ValueError(
-                    "alpha must be a scalar or an array with same number of "
-                    f"entries as y. ({self.alpha.shape[0]} != {y.shape[0]})"
-                )
+        # Build the per-observation noise (diagonal of the added matrix).
+        alpha_diag = self._build_noise_diagonal(X, y, is_function)
 
         self.X_train_ = np.copy(X) if self.copy_X_train else X
         self.y_train_ = np.copy(y) if self.copy_X_train else y
+        self.alpha_diag_ = alpha_diag
 
         if self.optimizer is not None and self.kernel_.n_dims > 0:
             # Choose hyperparameters based on maximizing the log-marginal
@@ -346,8 +417,8 @@ class GaussianProcessRegressor(MultiOutputMixin, RegressorMixin, BaseEstimator):
         # Precompute quantities required for predictions which are independent
         # of actual query points
         # Alg. 2.1, page 19, line 2 -> L = cholesky(K + sigma^2 I)
-        K = self.kernel_(self.X_train_)
-        K[np.diag_indices_from(K)] += self.alpha
+        K = self._train_covariance()
+        K[np.diag_indices_from(K)] += self.alpha_diag_
         try:
             self.L_ = cholesky(K, lower=GPR_CHOLESKY_LOWER, check_finite=False)
         except np.linalg.LinAlgError as exc:
@@ -367,7 +438,115 @@ class GaussianProcessRegressor(MultiOutputMixin, RegressorMixin, BaseEstimator):
         )
         return self
 
-    def predict(self, X, return_std=False, return_cov=False):
+    def _build_noise_diagonal(self, X, y, is_function):
+        """Assemble the per-observation noise variances.
+
+        Function-value observations use ``alpha`` and partial-derivative
+        observations use ``derivative_alpha``; each can be a scalar or an
+        array with one entry per observation of the corresponding kind.
+        """
+        n_samples = X.shape[0]
+
+        if not self._has_derivatives:
+            # Backward-compatible behaviour of ``alpha``.
+            if np.iterable(self.alpha):
+                alpha = np.asarray(self.alpha, dtype=float)
+                if alpha.shape[0] != n_samples:
+                    if alpha.shape[0] == 1:
+                        return np.full(n_samples, alpha[0])
+                    raise ValueError(
+                        "alpha must be a scalar or an array with same number "
+                        "of entries as y. "
+                        f"({alpha.shape[0]} != {n_samples})"
+                    )
+                return alpha
+            return np.full(n_samples, float(self.alpha))
+
+        alpha_diag = np.empty(n_samples, dtype=float)
+        function_rows = np.where(is_function)[0]
+        derivative_rows = np.where(~is_function)[0]
+
+        for noise, rows, name in (
+            (self.alpha, function_rows, "function-value"),
+            (self.derivative_alpha, derivative_rows, "derivative"),
+        ):
+            if rows.size == 0:
+                continue
+            if np.iterable(noise):
+                noise = np.asarray(noise, dtype=float)
+                if noise.ndim != 1:
+                    raise ValueError(
+                        "Noise levels must be a scalar or a 1d array, got "
+                        f"shape {noise.shape}."
+                    )
+                if noise.shape[0] == 1:
+                    noise = np.full(rows.size, noise[0])
+                elif noise.shape[0] != rows.size:
+                    raise ValueError(
+                        "Noise levels must be a scalar or an array with one "
+                        f"entry per {name} observation ({rows.size}), got "
+                        f"{noise.shape[0]} entries."
+                    )
+                alpha_diag[rows] = noise
+            else:
+                alpha_diag[rows] = float(noise)
+        return alpha_diag
+
+    def _train_covariance(self):
+        """Covariance matrix between the (mixed) training observations."""
+        if not self._has_derivatives:
+            return self.kernel_(self.X_train_)
+        return _mixed_covariance(
+            self._constant_kernel_,
+            self._rbf_kernel_,
+            self.X_train_,
+            self.X_train_,
+            self.derivative_,
+            self.derivative_,
+        )
+
+    def _cross_covariance(self, X, derivative):
+        """Covariance between query observations and training observations."""
+        dx = _check_derivative(derivative, X)
+        if not self._has_derivatives:
+            if np.any(dx >= 0):
+                raise ValueError(
+                    "Partial derivatives can only be predicted when "
+                    "partial-derivative observations were passed to fit()."
+                )
+            return self.kernel_(X, self.X_train_), dx
+        return (
+            _mixed_covariance(
+                self._constant_kernel_,
+                self._rbf_kernel_,
+                X,
+                self.X_train_,
+                dx,
+                self.derivative_,
+            ),
+            dx,
+        )
+
+    def _query_variance_diag(self, X, dx):
+        """Prior variance of the (mixed) query observations."""
+        if not self._has_derivatives or not np.any(dx >= 0):
+            return self.kernel_.diag(X)
+        return _mixed_diag(self._constant_kernel_, self._rbf_kernel_, X, dx)
+
+    def _query_covariance(self, X, dx):
+        """Prior covariance between the (mixed) query observations."""
+        if not self._has_derivatives or not np.any(dx >= 0):
+            return self.kernel_(X)
+        return _mixed_covariance(
+            self._constant_kernel_,
+            self._rbf_kernel_,
+            X,
+            X,
+            dx,
+            dx,
+        )
+
+    def predict(self, X, return_std=False, return_cov=False, derivative=None):
         """Predict using the Gaussian process regression model.
 
         We can also predict based on an unfitted model by using the GP prior.
@@ -387,6 +566,16 @@ class GaussianProcessRegressor(MultiOutputMixin, RegressorMixin, BaseEstimator):
         return_cov : bool, default=False
             If True, the covariance of the joint predictive distribution at
             the query points is returned along with the mean.
+
+        derivative : array-like of shape (n_samples,), default=None
+            Kind of prediction requested at each row of ``X``: -1 (the
+            default for all rows) predicts the function value, a
+            non-negative index ``d`` predicts the partial derivative with
+            respect to feature ``d``. Predicting derivatives requires that
+            derivative observations were passed to :meth:`fit` and that the
+            kernel is a product of a
+            :class:`~sklearn.gaussian_process.kernels.ConstantKernel` and an
+            :class:`~sklearn.gaussian_process.kernels.RBF`.
 
         Returns
         -------
@@ -415,6 +604,11 @@ class GaussianProcessRegressor(MultiOutputMixin, RegressorMixin, BaseEstimator):
         X = validate_data(self, X, ensure_2d=ensure_2d, dtype=dtype, reset=False)
 
         if not hasattr(self, "X_train_"):  # Unfitted;predict based on GP prior
+            if derivative is not None and np.any(np.asarray(derivative) >= 0):
+                raise ValueError(
+                    "Partial derivatives cannot be predicted from an "
+                    "unfitted GaussianProcessRegressor."
+                )
             if self.kernel is None:
                 kernel = C(1.0, constant_value_bounds="fixed") * RBF(
                     1.0, length_scale_bounds="fixed"
@@ -443,11 +637,15 @@ class GaussianProcessRegressor(MultiOutputMixin, RegressorMixin, BaseEstimator):
                 return y_mean
         else:  # Predict based on GP posterior
             # Alg 2.1, page 19, line 4 -> f*_bar = K(X_test, X_train) . alpha
-            K_trans = self.kernel_(X, self.X_train_)
+            K_trans, dx = self._cross_covariance(X, derivative)
             y_mean = K_trans @ self.alpha_
 
-            # undo normalisation
-            y_mean = self._y_train_std * y_mean + self._y_train_mean
+            # Undo normalisation. Derivative predictions are not shifted by
+            # the (constant) target mean.
+            y_mean = self._y_train_std * y_mean
+            is_function = dx == FUNCTION_TAG
+            if np.any(is_function):
+                y_mean[is_function] += self._y_train_mean
 
             # if y_mean has shape (n_samples, 1), reshape to (n_samples,)
             if y_mean.ndim > 1 and y_mean.shape[1] == 1:
@@ -463,7 +661,7 @@ class GaussianProcessRegressor(MultiOutputMixin, RegressorMixin, BaseEstimator):
 
             if return_cov:
                 # Alg 2.1, page 19, line 6 -> K(X_test, X_test) - v^T. v
-                y_cov = self.kernel_(X) - V.T @ V
+                y_cov = self._query_covariance(X, dx) - V.T @ V
 
                 # undo normalisation
                 y_cov = np.outer(y_cov, self._y_train_std**2).reshape(*y_cov.shape, -1)
@@ -477,7 +675,7 @@ class GaussianProcessRegressor(MultiOutputMixin, RegressorMixin, BaseEstimator):
                 # Compute variance of predictive distribution
                 # Use einsum to avoid explicitly forming the large matrix
                 # V^T @ V just to extract its diagonal afterward.
-                y_var = self.kernel_.diag(X).copy()
+                y_var = self._query_variance_diag(X, dx).copy()
                 y_var -= np.einsum("ij,ji->i", V.T, V)
 
                 # Check if any of the variances is negative because of
@@ -499,7 +697,7 @@ class GaussianProcessRegressor(MultiOutputMixin, RegressorMixin, BaseEstimator):
 
                 return y_mean, np.sqrt(y_var)
 
-    def sample_y(self, X, n_samples=1, random_state=0):
+    def sample_y(self, X, n_samples=1, random_state=0, derivative=None):
         """Draw samples from Gaussian process and evaluate at X.
 
         Parameters
@@ -516,6 +714,11 @@ class GaussianProcessRegressor(MultiOutputMixin, RegressorMixin, BaseEstimator):
             calls.
             See :term:`Glossary <random_state>`.
 
+        derivative : array-like of shape (n_samples_X,), default=None
+            Kind of sample requested at each row of ``X``: -1 (default) for
+            function values and a non-negative feature index for samples of
+            the corresponding partial derivative. See :meth:`predict`.
+
         Returns
         -------
         y_samples : ndarray of shape (n_samples_X, n_samples), or \
@@ -525,7 +728,7 @@ class GaussianProcessRegressor(MultiOutputMixin, RegressorMixin, BaseEstimator):
         """
         rng = check_random_state(random_state)
 
-        y_mean, y_cov = self.predict(X, return_cov=True)
+        y_mean, y_cov = self.predict(X, return_cov=True, derivative=derivative)
         if y_mean.ndim == 1:
             y_samples = rng.multivariate_normal(y_mean, y_cov, n_samples).T
         else:
@@ -581,12 +784,32 @@ class GaussianProcessRegressor(MultiOutputMixin, RegressorMixin, BaseEstimator):
             kernel.theta = theta
 
         if eval_gradient:
-            K, K_gradient = kernel(self.X_train_, eval_gradient=True)
+            if getattr(self, "_has_derivatives", False):
+                K, K_gradient = _mixed_covariance_gradient(
+                    kernel, self.X_train_, self.derivative_
+                )
+            else:
+                K, K_gradient = kernel(self.X_train_, eval_gradient=True)
         else:
-            K = kernel(self.X_train_)
+            if getattr(self, "_has_derivatives", False):
+                ck, rbf = _unpack_constant_rbf(kernel)
+                K = _mixed_covariance(
+                    ck,
+                    rbf,
+                    self.X_train_,
+                    self.X_train_,
+                    self.derivative_,
+                    self.derivative_,
+                )
+            else:
+                K = kernel(self.X_train_)
 
-        # Alg. 2.1, page 19, line 2 -> L = cholesky(K + sigma^2 I)
-        K[np.diag_indices_from(K)] += self.alpha
+        # Alg. 2.1, page 19, line 2 -> L = cholesky(K + noise)
+        if getattr(self, "_has_derivatives", False):
+            noise = self.alpha_diag_
+        else:
+            noise = self.alpha
+        K[np.diag_indices_from(K)] += noise
         try:
             L = cholesky(K, lower=GPR_CHOLESKY_LOWER, check_finite=False)
         except np.linalg.LinAlgError:
