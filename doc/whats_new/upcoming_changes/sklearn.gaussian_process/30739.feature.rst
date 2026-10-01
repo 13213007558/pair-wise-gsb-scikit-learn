@@ -1,0 +1,9 @@
+- :class:`GaussianProcessRegressor` now accepts observations of partial
+  derivatives alongside function values through a new ``kind`` parameter of
+  :meth:`~sklearn.gaussian_process.GaussianProcessRegressor.fit` and
+  :meth:`~sklearn.gaussian_process.GaussianProcessRegressor.predict`. Per
+  observation noise levels can be set independently for the two kinds of
+  measurements through the ``alpha`` array. This first version supports an
+  isotropic or anisotropic :class:`~sklearn.gaussian_process.kernels.RBF`
+  multiplied by a :class:`~sklearn.gaussian_process.kernels.ConstantKernel`.
+  :issue:`30739`.

@@ -18,6 +18,7 @@ from sklearn.gaussian_process.kernels import (
     RBF,
     DotProduct,
     ExpSineSquared,
+    Matern,
     WhiteKernel,
 )
 from sklearn.gaussian_process.kernels import (
@@ -876,3 +877,382 @@ def test_gpr_predict_no_cov_no_std_return(kernel):
     y_pred = gpr.predict(X, return_cov=False, return_std=False)
 
     assert_allclose(y_pred, y)
+
+
+# ---------------------------------------------------------------------------
+# Derivative observations: function values mixed with partial derivatives
+# ---------------------------------------------------------------------------
+
+
+def _constant_rbf_value(constant_value, length_scale, x, y):
+    length_scale = np.asarray(length_scale, dtype=np.float64)
+    z = (x - y) / length_scale
+    return constant_value * np.exp(-0.5 * np.dot(z, z))
+
+
+def _finite_difference_mixed_kernel(
+    constant_value, length_scale, X, kind_x, Y, kind_y, eps=1e-5
+):
+    """Reference implementation of the joint value/derivative kernel."""
+    X = np.atleast_2d(X)
+    Y = np.atleast_2d(Y)
+    K = np.zeros((len(X), len(Y)))
+    n_features = X.shape[1]
+    for i, (x, kx) in enumerate(zip(X, kind_x)):
+        for j, (y, ky) in enumerate(zip(Y, kind_y)):
+            if kx == -1 and ky == -1:
+                K[i, j] = _constant_rbf_value(constant_value, length_scale, x, y)
+            elif kx == -1:
+                e = np.zeros(n_features)
+                e[ky] = eps
+                K[i, j] = (
+                    _constant_rbf_value(constant_value, length_scale, x, y + e)
+                    - _constant_rbf_value(constant_value, length_scale, x, y - e)
+                ) / (2 * eps)
+            elif ky == -1:
+                e = np.zeros(n_features)
+                e[kx] = eps
+                K[i, j] = (
+                    _constant_rbf_value(constant_value, length_scale, x + e, y)
+                    - _constant_rbf_value(constant_value, length_scale, x - e, y)
+                ) / (2 * eps)
+            else:
+                ex = np.zeros(n_features)
+                ex[kx] = eps
+                ey = np.zeros(n_features)
+                ey[ky] = eps
+                K[i, j] = (
+                    _constant_rbf_value(constant_value, length_scale, x + ex, y + ey)
+                    - _constant_rbf_value(constant_value, length_scale, x + ex, y - ey)
+                    - _constant_rbf_value(constant_value, length_scale, x - ex, y + ey)
+                    + _constant_rbf_value(constant_value, length_scale, x - ex, y - ey)
+                ) / (4 * eps**2)
+    return K
+
+
+@pytest.mark.parametrize(
+    "length_scale",
+    [0.9, np.array([0.9, 1.3]), np.array([0.7, 1.1, 1.6])],
+)
+def test_derivative_mixed_kernel_blocks(length_scale):
+    # Check the four blocks (value/value, value/derivative,
+    # derivative/value, derivative/derivative) against finite differences of
+    # the ConstantKernel * RBF kernel.
+    from sklearn.gaussian_process._gpr import _rbf_derivative_cov
+
+    n_features = np.size(length_scale)
+    rng = np.random.RandomState(42)
+    X = rng.randn(5, n_features)
+    Y = rng.randn(4, n_features)
+    # build kinds explicitly: a value plus one derivative per dimension
+    kind_x = np.array([-1] + list(range(n_features)) + [0] * (4 - n_features))
+    kind_y = np.array([-1] + list(range(n_features)) + [0] * (3 - n_features))
+
+    constant_value = 1.7
+    K = _rbf_derivative_cov(constant_value, length_scale, X, kind_x, Y, kind_y)
+    K_ref = _finite_difference_mixed_kernel(
+        constant_value, length_scale, X, kind_x, Y, kind_y
+    )
+    assert_allclose(K, K_ref, rtol=2e-6, atol=2e-6)
+
+    # The joint covariance of a block of observations is symmetric.
+    K_xx = _rbf_derivative_cov(constant_value, length_scale, X, kind_x, X, kind_x)
+    assert_allclose(K_xx, K_xx.T)
+
+
+@pytest.mark.parametrize(
+    "length_scale",
+    [0.9, np.array([0.7, 1.1, 1.6])],
+)
+def test_derivative_kernel_hyperparameter_gradient(length_scale):
+    # Check the gradient with respect to log(C) and log(length_scale) for
+    # every block against numerical finite differences.
+    from sklearn.gaussian_process._gpr import _rbf_derivative_cov
+
+    n_features = np.size(length_scale)
+    rng = np.random.RandomState(1)
+    X = rng.randn(4, n_features)
+    Y = rng.randn(3, n_features)
+    kind_x = np.array([-1] + [0] * (len(X) - 1))
+    kind_y = np.array([-1] + [0] * (len(Y) - 1))
+    constant_value = 1.3
+
+    K, K_gradient = _rbf_derivative_cov(
+        constant_value, length_scale, X, kind_x, Y, kind_y, eval_gradient=True
+    )
+
+    def unpack(theta):
+        c = np.exp(theta[0])
+        ls = (
+            np.exp(theta[1:])
+            if np.size(length_scale) > 1
+            else np.exp(theta[1])
+        )
+        return c, ls
+
+    theta = np.concatenate(
+        [np.log([constant_value]), np.log(np.atleast_1d(length_scale))]
+    )
+    for i in range(len(kind_x)):
+        for j in range(len(kind_y)):
+            def objective(theta):
+                c, ls = unpack(theta)
+                return _rbf_derivative_cov(
+                    c, ls, X[i : i + 1], kind_x[i : i + 1],
+                    Y[j : j + 1], kind_y[j : j + 1],
+                )[0, 0]
+
+            numerical = approx_fprime(theta, objective, 1e-6)
+            assert_allclose(K_gradient[i, j], numerical, rtol=2e-4, atol=2e-5)
+
+
+def _sine_with_slopes_data():
+    x_values = np.linspace(-3, 3, 8)
+    x_slopes = np.array([-1.5, 0.0, 1.5])
+    X = np.concatenate([x_values, x_slopes])[:, None]
+    y = np.concatenate([np.sin(x_values), np.cos(x_slopes)])
+    kind = np.array([-1] * len(x_values) + [0] * len(x_slopes))
+    X_test = np.linspace(-3, 3, 61)[:, None]
+    return X, y, kind, X_test
+
+
+def test_derivative_gpr_sine_with_slopes():
+    # Usage example: a sine function sampled at a handful of positions, plus
+    # a few slope measurements. Incorporating slopes through derivative
+    # observations gives accurate value and derivative predictions, while
+    # feeding the slopes in as ordinary y samples cannot express this model.
+    X, y, kind, X_test = _sine_with_slopes_data()
+    kernel = C(1.0, (1e-2, 1e2)) * RBF(1.0, (1e-2, 1e1))
+
+    gpr = GaussianProcessRegressor(
+        kernel=kernel, alpha=1e-8, random_state=0
+    ).fit(X, y, kind=kind)
+
+    y_mean = gpr.predict(X_test)
+    assert_allclose(y_mean, np.sin(X_test[:, 0]), atol=2e-2)
+
+    d_mean = gpr.predict(X_test, kind=np.zeros(len(X_test), dtype=int))
+    assert_allclose(d_mean, np.cos(X_test[:, 0]), atol=3e-2)
+
+    # Same numbers treated as ordinary function-value observations are a
+    # much worse model of the sine.
+    gpr_naive = GaussianProcessRegressor(
+        kernel=kernel, alpha=1e-8, random_state=0
+    ).fit(X, y)
+    naive_error = np.abs(gpr_naive.predict(X_test) - np.sin(X_test[:, 0])).max()
+    assert np.abs(y_mean - np.sin(X_test[:, 0])).max() < naive_error
+
+
+def test_derivative_predict_matches_finite_difference_of_posterior():
+    # With value observations only, a derivative prediction must equal the
+    # derivative of the posterior mean and the posterior variance of the
+    # finite-difference quotient.
+    X, y, _, _ = _sine_with_slopes_data()
+    X = X[:8]
+    y = y[:8]
+    gpr = GaussianProcessRegressor(
+        kernel=C(1.5) * RBF(0.9), alpha=1e-8, optimizer=None
+    ).fit(X, y)
+
+    x = np.array([[0.2], [1.1], [-0.7]])
+    eps = 1e-5
+    x_plus = x + eps
+    x_minus = x - eps
+    fd_mean = (gpr.predict(x_plus) - gpr.predict(x_minus)) / (2 * eps)
+    d_mean = gpr.predict(x, kind=np.zeros(len(x), dtype=int))
+    assert_allclose(d_mean, fd_mean, rtol=1e-4, atol=1e-6)
+
+    # Query [x0+eps, x0-eps, x1+eps, x1-eps, ...] so that the two positions
+    # entering each finite-difference quotient are 2 rows apart.
+    Xc = np.empty((2 * len(x), x.shape[1]))
+    Xc[0::2] = x_plus
+    Xc[1::2] = x_minus
+    cov = gpr.predict(Xc, return_cov=True)[1]
+    plus = np.arange(0, 2 * len(x), 2)
+    minus = plus + 1
+    # variance of (f(x+eps) - f(x-eps)) / (2 eps)
+    var_fd = (
+        cov[plus, plus]
+        + cov[minus, minus]
+        - cov[plus, minus]
+        - cov[minus, plus]
+    ) / (4 * eps**2)
+    d_std = gpr.predict(x, kind=np.zeros(len(x), dtype=int), return_std=True)[1]
+    assert_allclose(d_std**2, var_fd, rtol=2e-3, atol=1e-6)
+
+
+def test_derivative_predict_mixed_kinds():
+    X, y, kind, _ = _sine_with_slopes_data()
+    gpr = GaussianProcessRegressor(
+        kernel=C(1.2) * RBF(1.1), alpha=1e-8, optimizer=None
+    ).fit(X, y, kind=kind)
+
+    X_test = np.array([[0.0], [0.5], [1.0], [-1.0]])
+    mixed_kind = np.array([-1, 0, 0, -1])
+    y_mixed = gpr.predict(X_test, kind=mixed_kind)
+
+    y_values = gpr.predict(X_test, kind=np.full(len(X_test), -1))
+    y_derivs = gpr.predict(X_test, kind=np.zeros(len(X_test), dtype=int))
+    expected = np.where(mixed_kind == -1, y_values, y_derivs)
+    assert_allclose(y_mixed, expected)
+
+
+def test_derivative_duplicate_position():
+    # A function value and a derivative measured at the very same position
+    # are two distinct rows of the joint system.
+    X = np.array([[0.0], [0.0], [1.0]])
+    y = np.array([0.0, 1.0, np.sin(1.0)])
+    kind = np.array([-1, 0, -1])
+    gpr = GaussianProcessRegressor(
+        kernel=C(1.0) * RBF(1.0), alpha=1e-10, optimizer=None
+    ).fit(X, y, kind=kind)
+
+    x0 = np.array([[0.0]])
+    assert_almost_equal(gpr.predict(x0), [0.0])
+    assert_almost_equal(gpr.predict(x0, kind=np.array([0])), [1.0])
+
+
+def test_derivative_per_observation_noise():
+    # Two conflicting slopes at the same position: the noise level can be
+    # set per observation, so the noisier slope is down-weighted.
+    X = np.array([[0.0], [0.0]])
+    y = np.array([1.02, 0.98])
+    kind = np.array([0, 0])
+    alpha = np.array([1e-12, 1.0])
+    gpr = GaussianProcessRegressor(
+        kernel=C(1.0) * RBF(1.0), alpha=alpha, optimizer=None
+    ).fit(X, y, kind=kind)
+    posterior_slope = gpr.predict(np.array([[0.0]]), kind=np.array([0]))
+    assert_array_less(np.abs(posterior_slope - 1.02), np.abs(posterior_slope - 0.98))
+
+    # A scalar alpha broadcasts to every observation.
+    GaussianProcessRegressor(
+        kernel=C(1.0) * RBF(1.0), alpha=1e-3, optimizer=None
+    ).fit(X, y, kind=kind)
+
+
+def test_derivative_normalize_y():
+    X, y, kind, X_test = _sine_with_slopes_data()
+    offset = 5.0
+    gpr = GaussianProcessRegressor(
+        kernel=C(1.2) * RBF(1.1), normalize_y=True, alpha=1e-8, optimizer=None
+    ).fit(X, y + offset, kind=kind)
+    gpr_ref = GaussianProcessRegressor(
+        kernel=C(1.2) * RBF(1.1), normalize_y=False, alpha=1e-8, optimizer=None
+    ).fit(X, y, kind=kind)
+
+    assert_allclose(gpr.predict(X_test), gpr_ref.predict(X_test) + offset)
+    # Derivatives carry the scale but not the constant mean offset.
+    d_kind = np.zeros(len(X_test), dtype=int)
+    assert_allclose(
+        gpr.predict(X_test, kind=d_kind),
+        gpr_ref.predict(X_test, kind=d_kind),
+    )
+
+
+def test_derivative_prior_predictions():
+    # Unfitted predictions use the GP prior; zero mean and analytic value
+    # and derivative (co)variances.
+    constant_value = 2.0
+    length_scale = 0.7
+    gpr = GaussianProcessRegressor(
+        kernel=C(constant_value) * RBF(length_scale)
+    )
+    X = np.array([[0.0], [0.0]])
+    mean, cov = gpr.predict(X, kind=np.array([-1, 0]), return_cov=True)
+    assert_allclose(mean, [0.0, 0.0])
+    # var(f) = C and var(df/dx) = C / l**2; cross term vanishes at same point
+    assert_allclose(np.diag(cov), [constant_value, constant_value / length_scale**2])
+    assert_allclose(cov[0, 1], 0.0, atol=1e-12)
+
+    X2 = np.array([[0.0], [1.0]])
+    cov2 = gpr.predict(X2, kind=np.array([-1, 0]), return_cov=True)[1]
+    # cov(f(0), df/dx(1)) = d/dy k(0, y)|_{y=1} = -C/l^2 exp(-1/(2l^2))
+    # because (x - y)/l^2 = -1/l^2 at (x=0, y=1).
+    expected = -constant_value / length_scale**2 * np.exp(
+        -1 / (2 * length_scale**2)
+    )
+    assert_allclose(cov2[0, 1], expected)
+
+
+def test_derivative_sample_y_mixed_kinds():
+    X = np.array([[0.0], [1.0], [2.0]])
+    y = np.array([0.0, 0.84, 0.91])
+    kind = np.array([-1, -1, 0])
+    gpr = GaussianProcessRegressor(
+        kernel=C(1.0) * RBF(0.8), alpha=1e-8, optimizer=None
+    ).fit(X, y, kind=kind)
+
+    X_query = np.array([[0.5], [1.5]])
+    query_kind = np.array([-1, 0])
+    samples = gpr.sample_y(
+        X_query, n_samples=4000, random_state=0, kind=query_kind
+    )
+    assert samples.shape == (2, 4000)
+
+    mean, cov = gpr.predict(X_query, return_cov=True, kind=query_kind)
+    assert_allclose(samples.mean(axis=1), mean, atol=0.1)
+    assert_allclose(np.cov(samples), cov, atol=0.1)
+
+
+def test_derivative_obs_kind_attribute():
+    X, y, kind, _ = _sine_with_slopes_data()
+    gpr = GaussianProcessRegressor(
+        kernel=C() * RBF(), alpha=1e-8, optimizer=None
+    ).fit(X, y, kind=kind)
+    assert_array_almost_equal(gpr.obs_kind_, kind)
+
+    # Ordinary fits are tagged as function values.
+    gpr_values = GaussianProcessRegressor().fit(X[:8], y[:8])
+    assert_allclose(gpr_values.obs_kind_, np.full(8, -1))
+
+
+def test_derivative_log_marginal_likelihood_gradient():
+    X, y, kind, _ = _sine_with_slopes_data()
+    gpr = GaussianProcessRegressor(
+        kernel=C(0.7) * RBF(0.6), alpha=1e-8, optimizer=None
+    ).fit(X, y, kind=kind)
+
+    theta = gpr.kernel_.theta
+    lml, grad = gpr.log_marginal_likelihood(theta, eval_gradient=True)
+    numerical = approx_fprime(
+        theta, lambda t: gpr.log_marginal_likelihood(t), 1e-6
+    )
+    assert_allclose(grad, numerical, rtol=1e-4, atol=1e-6)
+    assert np.isfinite(lml)
+
+    # theta must follow the [log(C), log(length_scale)...] ordering
+    with pytest.raises(ValueError):
+        gpr.log_marginal_likelihood(theta[:-1])
+
+
+@pytest.mark.parametrize(
+    "kernel",
+    [RBF(1.0), C() + RBF(1.0), C() * Matern(1.0)],
+)
+def test_derivative_unsupported_kernel(kernel):
+    X, y, kind, _ = _sine_with_slopes_data()
+    gpr = GaussianProcessRegressor(kernel=kernel, alpha=1e-8)
+    with pytest.raises(ValueError, match="ConstantKernel"):
+        gpr.fit(X, y, kind=kind)
+
+
+def test_derivative_invalid_kind():
+    X, y, _, _ = _sine_with_slopes_data()
+    gpr = GaussianProcessRegressor(kernel=C() * RBF())
+
+    # Feature index out of range (1D input)
+    with pytest.raises(ValueError):
+        gpr.fit(X, y, kind=np.full(len(y), 5))
+    # Wrong number of tags
+    with pytest.raises(ValueError):
+        gpr.fit(X, y, kind=np.zeros(len(y) + 1, dtype=int))
+    # Matern kernel does not provide the derivative blocks
+    with pytest.raises(ValueError, match="ConstantKernel"):
+        GaussianProcessRegressor(kernel=C() * Matern()).fit(
+            X, y, kind=np.r_[np.full(len(y) - 1, -1), 0]
+        )
+    # Predicting derivatives requires the restricted kernel
+    gpr_values = GaussianProcessRegressor(kernel=C() + RBF()).fit(X[:8], y[:8])
+    with pytest.raises(ValueError, match="ConstantKernel and"):
+        gpr_values.predict(X[:2], kind=np.array([0, 0]))
